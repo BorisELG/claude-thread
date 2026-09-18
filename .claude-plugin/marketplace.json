@@ -1,0 +1,13 @@
+{
+  "name": "claude-thread",
+  "owner": {
+    "name": "Boris El Gareh"
+  },
+  "plugins": [
+    {
+      "name": "claude-thread",
+      "source": "./",
+      "description": "Keep the thread of a long Claude Code session across /clear."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "claude-thread",
+  "description": "Keep the thread of a long Claude Code session across /clear: task state and decisions are re-injected at every session start.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Boris El Gareh"
+  },
+  "repository": "https://github.com/BorisELG/claude-thread",
+  "license": "MIT"
+}
