@@ -2,7 +2,7 @@
 
 Keep the thread of a long Claude Code session across `/clear`.
 
-Compaction replaces your context with a summary you did not write. `/clear` gives you a clean context, but the agent forgets where the task stands and what was decided. `claude-thread` makes the agent keep two small files up to date and re-injects them at every session start, so a `/clear` costs nothing.
+`/compact` replaces your context with a summary you did not write. `/clear` gives you a clean context, but the agent forgets where the task stands and what was decided. `claude-thread` makes the agent keep two small files up to date and re-injects them at every session start, so a `/clear` costs nothing.
 
 ## How it works
 
