@@ -1,7 +1,7 @@
 {
   "name": "claude-thread",
   "description": "Keep the thread of a long Claude Code session across /clear: hooks keep a handoff journal while you work, and after a /clear, answer yes and it is injected.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Boris El Gareh"
   },
