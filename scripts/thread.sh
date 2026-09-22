@@ -16,6 +16,7 @@ dir=${CLAUDE_THREAD_HOME:-$HOME/.claude/threads}
 link="$dir/.live/pid-$pid"
 ask="$dir/.live/ask-$session"
 doc="$dir/$session.md"
+notes="$dir/$session.jev.json"
 
 # The handoff is a journal the hooks keep while you work: what you asked, what Claude
 # answered at the end of each turn, the files it edited. The hook writes it, not the
@@ -31,47 +32,103 @@ note() {
   printf '%s\n' "$@" >>"$doc"
 }
 
-# Jev (typesafe.ai) is a decision model: it reads the journal and tells, for each earlier
-# answer, how likely it still holds. It writes no text, so what comes back stays verbatim.
-# Prints {"s<id>": probability}. Without a key, without an earlier answer or on any failure
-# it prints nothing, and the handoff does without it.
-jev() {
-  local request
+# The journal as sections: the head line, then one entry per request or answer, in order.
+# The ids are positions, stable because the journal is append-only.
+sections() {
+  awk '/^## (User|Claude)$/ { printf "\036%s\037", $2; next } { print }' "$doc" |
+    jq -Rs 'split("\u001e") | .[0] as $head
+      | [.[1:][] | split("\u001f") | {author: .[0], text: .[1]}] | to_entries
+      | {head: $head, sections: map(.value + {id: .key})}'
+}
+
+# The scores Jev gave so far, kept next to the journal: {last, scores: {"s<id>": probability}}.
+stored() {
+  jq -c '{last: (.last // -1), scores: (.scores // {})}' "$notes" 2>/dev/null || echo '{"last": -1, "scores": {}}'
+}
+
+# How many earlier answers have no score yet, from the journal on stdin: a call failed, is
+# still running, or left them beyond the ceiling.
+unscored() {
+  jq --argjson scores "$(stored | jq .scores)" '
+    ([.sections[] | select(.author == "Claude") | .id] | max // -1) as $last
+    | [.sections[] | select(.author == "Claude" and .id < $last and $scores["s\(.id)"] == null)] | length'
+}
+behind() { [ "$(sections | unscored)" -gt 0 ]; }
+
+# Jev (typesafe.ai) is a decision model: it reads a state and tells, for each earlier answer,
+# how likely it still holds. It writes no text, so what comes back stays verbatim.
+# Every turn sends the requests, the earlier answers still alive and the last answer, and
+# asks about each alive answer. An answer scored under 0.3 is frozen: it keeps its score and
+# is never sent again. A request stays under CLAUDE_THREAD_STATE bytes: the lowest scored
+# answers are left out first and keep their score, and an unscored answer left out gets
+# another round, up to the rounds given. Without a key, without anything to ask or on any
+# failure, nothing is written.
+score() { # [rounds]
+  local rounds=${1:-5} journal request answers last merged before
+  journal=$(cat)
   [ -n "${TYPESAFE_API_KEY:-}" ] || return 0
-  request=$(jq '{model: "jev-latest", state: [.sections[] | {id, author, text}],
-    questions: (.sections | map(select(.keep | not) | {key: "s\(.id)", value: {type: "noul",
-      instructions: "Section \(.id) is an answer written by the assistant earlier in this work session. At the end of the session, is section \(.id) still in force and still useful to continue the work?",
-      criteria: {
-        "true": "Its content still holds at the end: nothing later replaces it, and the user did not abandon, reject or correct it afterwards.",
-        "false": "It is outdated: a later section replaces or revises it, or the user later abandoned, rejected or corrected what it proposes."}}}) | from_entries)}
-    | select(.questions != {})')
+  while [ "$rounds" -gt 0 ]; do
+    rounds=$((rounds - 1))
+    before=$(unscored <<<"$journal")
+    round || return 0
+    # Another round only while an unscored answer was left out and this one scored a new one.
+    [ "$(unscored <<<"$journal")" -gt 0 ] && [ "$(unscored <<<"$journal")" -lt "$before" ] || return 0
+  done
+}
+round() {
+  request=$(jq --argjson scores "$(stored | jq .scores)" --argjson max "${CLAUDE_THREAD_STATE:-30000}" '
+    def size: {id, author, text} | tojson | utf8bytelength;
+    ([.sections[] | select(.author == "Claude") | .id] | max // -1) as $last
+    | [.sections[] | select(.author == "User" or .id >= $last)] as $fixed
+    | ([.sections[] | select(.author == "Claude" and .id < $last)
+        | . + {score: ($scores["s\(.id)"] // 1)} | select(.score >= 0.3)] | sort_by(-.score, -.id)) as $alive
+    | ($fixed | map(size) | add // 0) as $base
+    | select($alive != [] and $base <= $max)
+    | (reduce $alive[] as $s ({bytes: $base, ids: [], full: false};
+        if .full or .bytes + ($s | size) > $max then .full = true
+        else {bytes: (.bytes + ($s | size)), ids: (.ids + [$s.id]), full: false} end) | .ids) as $in
+    | select($in != [])
+    | {model: "jev-latest",
+       state: (($fixed + [$alive[] | select(.id | IN($in[]))]) | sort_by(.id) | map({id, author, text})),
+       questions: ([$in[] | {key: "s\(.)", value: {type: "noul",
+         instructions: "Section \(.) is an answer written by the assistant earlier in this work session. At this point of the session, is section \(.) still in force and still useful to continue the work?",
+         criteria: {
+           "true": "Its content still holds now: nothing later replaces it, and the user did not abandon, reject or correct it afterwards.",
+           "false": "It is outdated: a later section replaces or revises it, or the user later abandoned, rejected or corrected what it proposes."}}}] | from_entries)}' <<<"$journal") || return 0
   [ -n "$request" ] || return 0
   # The key goes through a config file descriptor, so it never shows up in ps.
-  curl -sS -m 3 https://api.typesafe.ai/v1/systemone -H 'Content-Type: application/json' --data @- \
+  answers=$(curl -sS -m 3 https://api.typesafe.ai/v1/systemone -H 'Content-Type: application/json' --data @- \
     -K <(printf 'header = "Authorization: Bearer %s"\n' "$TYPESAFE_API_KEY") <<<"$request" |
-    jq -e '.answers | map_values(.noul)'
+    jq -ec '.answers | map_values(.noul) | select(all(.[]; type == "number"))') || return 0
+  last=$(jq '.state | map(select(.author == "Claude") | .id) | max' <<<"$request")
+  # A slow call from an earlier turn must not overwrite newer scores.
+  merged=$(jq -nc --argjson old "$(stored)" --argjson new "$answers" --argjson last "$last" \
+    'select($old.last <= $last) | {last: $last, scores: ($old.scores + $new)}') || return 0
+  [ -n "$merged" ] || return 0
+  printf '%s\n' "$merged" >"$notes.$$" && mv -f "$notes.$$" "$notes"
 }
 
 # A yes brings back a state, not the whole conversation: the requests, the edited files and
 # the last answer, always. The earlier answers hold the options, plans and verdicts that
-# were replaced since: only the ones Jev still believes in come back, best first, while the
-# handoff stays under 9000 bytes. Above 10000, Claude Code moves a hook's context to a file
-# and Claude has to read it with a tool call, which shows in the console. On real journals
-# the answers that were replaced score under 0.25.
+# were replaced since: only the ones Jev scored 0.3 or more come back, best first, while the
+# handoff stays under 9000 bytes. An answer Jev never scored comes back first: nothing judged
+# it. Above 10000, Claude Code moves a hook's context to a file and Claude has to read it
+# with a tool call, which shows in the console. Without any score, the hook does not sort:
+# the whole journal comes back.
 handoff() {
-  local journal scores
-  journal=$(awk '/^## (User|Claude)$/ { printf "\036%s\037", $2; next } { print }' "$doc" |
-    jq -Rs 'split("\u001e") | .[0] as $head
-      | [.[1:][] | split("\u001f") | {author: .[0], text: .[1]}] | to_entries | map(.value + {id: .key}) as $sections
-      | ([$sections[] | select(.author == "Claude") | .id] | max // -1) as $last
-      | {head: $head, sections: [$sections[] | . + {keep: (.author == "User" or .id >= $last)}]}')
-  scores=$(jev <<<"$journal") || scores=
-  jq -r --argjson scores "${scores:-{\}}" 'def size: "## \(.author)\n\(.text)" | utf8bytelength;
-    (reduce (.sections | map(select(.keep | not) | . + {score: ($scores["s\(.id)"] // 0)} | select(.score >= 0.3)) | sort_by(-.score))[] as $answer
-      ({bytes: ((.head | utf8bytelength) + (.sections | map(select(.keep) | size) | add // 0)), ids: []};
-        if .bytes + ($answer | size) <= 9000 then {bytes: (.bytes + ($answer | size)), ids: (.ids + [$answer.id])} else . end)
+  if [ ! -f "$notes" ]; then
+    cat "$doc"
+    return
+  fi
+  sections | jq -r --argjson scores "$(stored | jq .scores)" 'def size: "## \(.author)\n\(.text)" | utf8bytelength;
+    ([.sections[] | select(.author == "Claude") | .id] | max // -1) as $last
+    | (.sections | map(. + {keep: (.author == "User" or .id >= $last)})) as $sections
+    | ($sections | map(select(.keep | not) | . + {score: ($scores["s\(.id)"] // 1)} | select(.score >= 0.3)) | sort_by(-.score, -.id)) as $ranked
+    | (reduce $ranked[] as $answer
+        ({bytes: ((.head | utf8bytelength) + ($sections | map(select(.keep) | size) | add // 0)), ids: []};
+          if .bytes + ($answer | size) <= 9000 then {bytes: (.bytes + ($answer | size)), ids: (.ids + [$answer.id])} else . end)
       | .ids) as $back
-    | .head + (.sections | map(select(.keep or (.id | IN($back[]))) | "## \(.author)\n\(.text)") | join(""))' <<<"$journal"
+    | .head + ($sections | map(select(.keep or (.id | IN($back[]))) | "## \(.author)\n\(.text)") | join(""))'
 }
 
 case $event in
@@ -93,7 +150,15 @@ SessionEnd)
   printf '%s\n%s\n' "$session" "$title" >"$link"
   ;;
 SessionStart)
-  [ "$(jq -r '.source // empty' <<<"$input")" = clear ] || exit 0
+  source=$(jq -r '.source // empty' <<<"$input")
+  # The key comes from the environment Claude Code starts from, so a missing one is
+  # said once, when it opens. Without Jev, a yes brings back the whole journal.
+  if [ "$source" = startup ] || [ "$source" = resume ]; then
+    [ -z "${TYPESAFE_API_KEY:-}" ] || exit 0
+    jq -n '{systemMessage: "claude-thread: TYPESAFE_API_KEY is not set. Without Jev, a yes after /clear brings back the whole journal, dead ends included. Get a key at https://typesafe.ai", suppressOutput: true}'
+    exit 0
+  fi
+  [ "$source" = clear ] || exit 0
   [ -f "$link" ] || exit 0
   { read -r previous && read -r title; } <"$link"
   [ -f "$dir/$previous.md" ] || exit 0
@@ -114,6 +179,9 @@ UserPromptSubmit)
     if [[ $prompt =~ ^[[:space:]]*(y|yes|yep|yeah|yup|sure|ok|okay|go|o|oui|ouais|continue|continuer|reprends|reprendre)([^[:alnum:]]|$) ]] && [ -f "$dir/$previous.md" ]; then
       # A thread is a chain of continued sessions. Its journal follows the live one.
       mv "$dir/$previous.md" "$doc"
+      [ ! -f "$dir/$previous.jev.json" ] || mv -f "$dir/$previous.jev.json" "$notes"
+      # A short catch-up when the last turn's scoring failed; the yes then uses whatever is stored.
+      ! behind || sections | score 2
       jq -n --rawfile handoff <(handoff | tail -c "${CLAUDE_THREAD_MAX:-60000}") '{
         suppressOutput: true,
         hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: "The user chose to continue the previous work. Here is its handoff, kept by a hook: what the user asked, the files you edited, your last answer and the earlier ones that still hold. The answers that were replaced or abandoned since are left out on purpose. Continue from where it stopped, do not ask again for what it already says. If nothing is left to do, say so in one sentence and wait.\n\n\($handoff)"}}'
@@ -126,7 +194,13 @@ UserPromptSubmit)
   ;;
 Stop)
   answer=$(jq -r '.last_assistant_message // empty' <<<"$input")
-  [ -z "$answer" ] || note "" "## Claude" "$answer"
+  [ -n "$answer" ] || exit 0
+  note "" "## Claude" "$answer"
+  # Scoring runs detached, with every descriptor closed, so the turn ends at once: Claude
+  # Code waits for the hook's output pipe, and a background list would keep it open.
+  if [ -n "${TYPESAFE_API_KEY:-}" ]; then
+    (sections | score) >/dev/null 2>&1 </dev/null &
+  fi
   ;;
 PostToolUse)
   file=$(jq -r '.tool_input | .file_path // .notebook_path // empty' <<<"$input")
