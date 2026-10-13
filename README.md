@@ -2,7 +2,7 @@
 
 Keep the thread of a long Claude Code session across `/clear`.
 
-Large context windows are a bad idea. Push deep into the context window and the model starts forgetting what sits in the center. `/compact` doesn't help much, auto or not: Claude keeps a shorter, less accurate copy of the whole conversation, with the mistakes, bad ideas and things that didn't work still in it, and it costs a lot of tokens. With a clean handoff and a `/clear`, Claude starts fresh with only what it needs to continue, and uses far fewer tokens.
+Large context windows are a bad idea. Push deep into the context window and the model starts forgetting what sits in the center. `/compact` doesn't help much, auto or not: Claude keeps a shorter, less accurate copy of the whole conversation, with the mistakes, bad ideas and things that didn't work still in it. And the cost is not the compaction, which is one large request: it is every turn spent at a large context, since each turn re-reads the whole conversation. With a clean handoff and a `/clear`, Claude starts fresh with only what it needs to continue, and the turns that follow cost a fraction.
 
 ## Install
 
@@ -17,11 +17,11 @@ Requirements: `bash`, `jq`, `curl`. Linux and macOS.
 
 ## How it works
 
-1. While you work, hooks keep a journal of the session: your requests, the files Claude edited and Claude's final answer of each turn. No model, no token, nothing in the console.
+1. While you work, hooks keep a journal of the session: your requests and Claude's final answer of each turn. No model, no token, nothing in the console.
 2. After `/clear`, Claude asks: `Continue the previous work ("<title>")?`
-3. Reply `yes`: the handoff comes with your prompt and Claude continues where it stopped. `yes, and fix the conflict first` works too. Anything else is a new request, and the cleared conversation stays in `/resume`.
+3. Reply `yes`: the handoff comes with your prompt and Claude continues where it stopped. `yes, and fix the conflict first` works too: what comes with the yes is handled first. Anything else is a new request, and the cleared conversation stays in `/resume`.
 
-The handoff is a state, not the conversation: your requests, the edited files, the last answer, and the earlier answers that still hold. Rejected options and replaced plans stay out. Nothing is summarized or rewritten.
+The handoff is a state, not the conversation: your requests, the last answer, and the earlier answers that still hold. The edited files stay out, because `git diff` shows them after the yes. Rejected options and replaced plans stay out. Nothing is summarized or rewritten.
 
 Journals live in `~/.claude/threads/`, outside your repository, one file per thread:
 
@@ -30,8 +30,6 @@ Journals live in `~/.claude/threads/`, outside your repository, one file per thr
 
 ## User
 fix the login bug
-- edited: src/auth.ts
-- edited: tests/auth.spec.ts
 
 ## Claude
 Fixed: the token expired too early. Test added, the suite is green.
@@ -74,8 +72,9 @@ It shows `session name · 87k` and turns red with `⚠ /clear` past 100k tokens 
 
 - Jev keeps or drops a whole answer. An answer half outdated comes back whole or not at all.
 - Above 10000 bytes, Claude Code moves the handoff to a file and Claude reads it with a tool call, which shows in the console. The earlier answers never push it past 9000 bytes; many long requests, a very long last answer or a journal without scores can.
-- Messages from subagents and background tasks are not requests, so they stay out of the journal. A turn you interrupt keeps only its request and its edited files.
-- `/clear` keeps the Claude Code process, so the hooks link sessions by its PID, read from `CLAUDE_PID`, which Claude Code sets but does not document. Without it, the hook falls back to the parent of its own shell. Two sessions running in parallel never share a thread.
+- Messages from subagents and background tasks are not requests, so they stay out of the journal. A turn you interrupt keeps only its request.
+- The journal starts with the hooks. A session opened before the plugin was installed, or resumed with it for the first time, hands off only the turns made since.
+- `/clear` keeps the Claude Code process, so the hooks link sessions by its PID, read from `CLAUDE_PID`, which Claude Code sets but does not document. Without it, the hook falls back to the parent of its own shell. The link is refreshed at every journal write, so nothing depends on the end of the session. Two sessions running in parallel never share a thread.
 - Journals older than 30 days are deleted at the next `/clear`.
 
 Tests: `tests/thread.test.sh` runs the hooks against fake inputs, without Claude Code and without the network.

@@ -10,7 +10,8 @@ session=$(jq -r '.session_id // empty' <<<"$input")
 [ -n "$session" ] || exit 0
 
 # /clear gives the session a new session_id and the hook input does not name the
-# previous one. The Claude Code process stays the same, so its PID links them.
+# previous one. The Claude Code process stays the same, so its PID links them. The link
+# follows every journal write, so a /clear needs nothing from the end of the session.
 pid=${CLAUDE_PID:-$(ps -o ppid= -p "$PPID" | tr -d ' ')}
 dir=${CLAUDE_THREAD_HOME:-$HOME/.claude/threads}
 link="$dir/.live/pid-$pid"
@@ -18,9 +19,12 @@ ask="$dir/.live/ask-$session"
 doc="$dir/$session.md"
 notes="$dir/$session.jev.json"
 
-# The handoff is a journal the hooks keep while you work: what you asked, what Claude
-# answered at the end of each turn, the files it edited. The hook writes it, not the
-# agent, so there is no model, no token and no tool call.
+# The link names the session whose journal a /clear of this process continues.
+live() { mkdir -p "$dir/.live" && printf '%s\n' "$session" >"$link"; }
+
+# The handoff is a journal the hooks keep while you work: what you asked and what Claude
+# answered at the end of each turn. The edited files stay out: git diff shows them after
+# the yes. The hook writes it, not the agent, so there is no model, no token and no tool call.
 note() {
   if [ ! -f "$doc" ]; then
     mkdir -p "$dir" || exit 0
@@ -30,6 +34,7 @@ note() {
     printf '# %s%s\n' "$cwd" "${branch:+ · $branch}" >"$doc"
   fi
   printf '%s\n' "$@" >>"$doc"
+  live
 }
 
 # The journal as sections: the head line, then one entry per request or answer, in order.
@@ -108,8 +113,8 @@ round() {
   printf '%s\n' "$merged" >"$notes.$$" && mv -f "$notes.$$" "$notes"
 }
 
-# A yes brings back a state, not the whole conversation: the requests, the edited files and
-# the last answer, always. The earlier answers hold the options, plans and verdicts that
+# A yes brings back a state, not the whole conversation: the requests and the last answer,
+# always. The earlier answers hold the options, plans and verdicts that
 # were replaced since: only the ones Jev scored 0.3 or more come back, best first, while the
 # handoff stays under 9000 bytes. An answer Jev never scored comes back first: nothing judged
 # it. Above 10000, Claude Code moves a hook's context to a file and Claude has to read it
@@ -117,7 +122,7 @@ round() {
 # the whole journal comes back.
 handoff() {
   if [ ! -f "$notes" ]; then
-    cat "$doc"
+    sections | jq -r '.head + (.sections | map("## \(.author)\n\(.text)") | join(""))'
     return
   fi
   sections | jq -r --argjson scores "$(stored | jq .scores)" 'def size: "## \(.author)\n\(.text)" | utf8bytelength;
@@ -132,23 +137,6 @@ handoff() {
 }
 
 case $event in
-SessionEnd)
-  [ "$(jq -r '.reason // empty' <<<"$input")" = clear ] || exit 0
-  # A session cleared before any prompt has nothing to continue: keep the older link.
-  if [ -f "$ask" ]; then
-    rm -f "$ask"
-    exit 0
-  fi
-  mkdir -p "$dir/.live"
-  find "$dir" -type f -mtime +30 -delete
-  if [ ! -f "$doc" ]; then
-    rm -f "$link"
-    exit 0
-  fi
-  title=$(jq -r '.session_title // empty' <<<"$input")
-  [ -n "$title" ] || title=$(grep '"type":"ai-title"' "$(jq -r '.transcript_path // empty' <<<"$input")" | tail -n 1 | jq -r '.aiTitle // empty')
-  printf '%s\n%s\n' "$session" "$title" >"$link"
-  ;;
 SessionStart)
   source=$(jq -r '.source // empty' <<<"$input")
   # The key comes from the environment Claude Code starts from, so a missing one is
@@ -159,9 +147,13 @@ SessionStart)
     exit 0
   fi
   [ "$source" = clear ] || exit 0
+  find "$dir" -type f -mtime +30 -delete
   [ -f "$link" ] || exit 0
-  { read -r previous && read -r title; } <"$link"
+  previous=$(head -n 1 "$link")
   [ -f "$dir/$previous.md" ] || exit 0
+  # The title is the one /resume shows. It sits in the transcript of the cleared session,
+  # next to the transcript of the new one.
+  title=$(grep '"type":"ai-title"' "$(dirname "$(jq -r '.transcript_path // empty' <<<"$input")")/$previous.jsonl" | tail -n 1 | jq -r '.aiTitle // empty')
   echo "$previous" >"$ask"
   question="Continue the previous work${title:+ (\"$title\")}? Reply \"yes\" to continue it, or just type a new request."
   jq -n --arg question "$question" '{
@@ -180,11 +172,12 @@ UserPromptSubmit)
       # A thread is a chain of continued sessions. Its journal follows the live one.
       mv "$dir/$previous.md" "$doc"
       [ ! -f "$dir/$previous.jev.json" ] || mv -f "$dir/$previous.jev.json" "$notes"
+      live
       # A short catch-up when the last turn's scoring failed; the yes then uses whatever is stored.
       ! behind || sections | score 2
       jq -n --rawfile handoff <(handoff | tail -c "${CLAUDE_THREAD_MAX:-60000}") '{
         suppressOutput: true,
-        hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: "The user chose to continue the previous work. Here is its handoff, kept by a hook: what the user asked, the files you edited, your last answer and the earlier ones that still hold. The answers that were replaced or abandoned since are left out on purpose. Continue from where it stopped, do not ask again for what it already says. If nothing is left to do, say so in one sentence and wait.\n\n\($handoff)"}}'
+        hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: "The user chose to continue the previous work. Here is its handoff, kept by a hook: what the user asked, your last answer and the earlier ones that still hold. The answers that were replaced or abandoned since are left out on purpose. Continue from where it stopped, do not ask again for what it already says. If the yes came with a question or a request, answer it first. If nothing is left to do, say so in one sentence and wait.\n\n\($handoff)"}}'
       # "yes, and fix the conflict first" is a request too. A bare yes is not.
       [[ ! ${prompt:${#BASH_REMATCH[0]}} =~ [[:alnum:]] ]] || note "" "## User" "$prompt"
       exit 0
@@ -201,10 +194,5 @@ Stop)
   if [ -n "${TYPESAFE_API_KEY:-}" ]; then
     (sections | score) >/dev/null 2>&1 </dev/null &
   fi
-  ;;
-PostToolUse)
-  file=$(jq -r '.tool_input | .file_path // .notebook_path // empty' <<<"$input")
-  file=${file#"$(jq -r '.cwd // empty' <<<"$input")"/}
-  [ -z "$file" ] || grep -qsxF -- "- edited: $file" "$doc" || note "- edited: $file"
   ;;
 esac

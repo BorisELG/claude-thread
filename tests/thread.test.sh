@@ -49,7 +49,7 @@ settle() { # session last: waits for the background scorer to store that turn
     sleep 0.1
   done
 }
-ms() { echo $((${EPOCHREALTIME/./} / 1000)); }
+ms() { echo $((${EPOCHREALTIME//[.,]/} / 1000)); }
 
 A=aaaaaaaa-0000 B=bbbbbbbb-0000 C=cccccccc-0000 D=dddddddd-0000 E=eeeeeeee-0000 F=ffffffff-0000 G=99999999-0000
 H=11111111-0000 I=22222222-0000 J=33333333-0000 K=44444444-0000 L=55555555-0000 M=66666666-0000
@@ -61,8 +61,7 @@ hook() { # event session pid [extra json]
     CLAUDE_PID="$3" "$root/scripts/thread.sh"
 }
 title() { jq -nc --arg t "$2" '{type: "ai-title", aiTitle: $t}' >"$work/$1.jsonl"; } # session title
-clear_from() { hook SessionEnd "$1" "$2" "{\"reason\":\"clear\",\"transcript_path\":\"$work/$1.jsonl\"}"; }
-clear_to() { hook SessionStart "$1" "$2" '{"source":"clear"}'; }
+clear_to() { hook SessionStart "$1" "$2" "{\"source\":\"clear\",\"transcript_path\":\"$work/$1.jsonl\"}"; }
 prompt() { hook UserPromptSubmit "$1" 111 "$(jq -n --arg p "$2" '{prompt: $p}')"; }
 stop() { hook Stop "$1" 111 "$(jq -n --arg m "$2" '{last_assistant_message: $m}')"; }
 edit() { hook PostToolUse "$1" 111 "$(jq -n --arg f "$2" '{tool_name: "Edit", tool_input: {file_path: $f}}')"; }
@@ -99,6 +98,7 @@ check "opening Claude Code with a key prints nothing" empty "$out"
 out=$(hook SessionStart "$A" 111 '{"source":"compact"}')
 check "compaction prints nothing" empty "$out"
 out=$(clear_to "$B" 111)
+check "/clear drops the journals older than 30 days" [ ! -e "$threads/old.md" ]
 check "/clear without a previous session prints nothing" empty "$out"
 
 out=$(prompt "$A" "ship the thing" 2>&1)
@@ -109,14 +109,14 @@ out=$(
   edit "$A" "$repo/src/deploy.sh" 2>&1
   edit "$A" "$repo/src/deploy.sh" 2>&1
 )
-check "an edit is journaled without a word" empty "$out"
+check "an edit prints nothing" empty "$out"
 out=$(stop "$A" "Shipped, the deploy is green." 2>&1)
 check "an answer is journaled without a word" empty "$out"
 journal=$(cat "$threads/$A.md")
 check "the journal starts with the directory and the branch" has "$(head -n 1 <<<"$journal")" "$repo · feat/login"
 check "the journal holds the request" has "$journal" "ship the thing"
 check "the journal holds the final answer" has "$journal" "Shipped, the deploy is green."
-check "an edited file is listed once, from the directory" [ "$(grep -c -- '^- edited: src/deploy.sh$' <<<"$journal")" = 1 ]
+check "an edited file stays out of the journal: git diff shows it" lacks "$journal" "src/deploy.sh"
 out=$(CLAUDE_THREAD_HOME=/proc/nope prompt "$A" "hello" 2>&1)
 code=$?
 check "a journal that cannot be written says nothing" empty "$out"
@@ -124,8 +124,6 @@ check "a journal that cannot be written is not an error" [ "$code" = 0 ]
 
 title "$A" "Ship the thing"
 touch -d '40 days ago' "$threads/old.md"
-clear_from "$A" 111
-check "/clear drops the journals older than 30 days" [ ! -e "$threads/old.md" ]
 out=$(hook SessionStart "$B" 111 '{"source":"compact"}')
 check "compaction with a previous session prints nothing" empty "$out"
 out=$(clear_to "$B" 111)
@@ -145,10 +143,8 @@ out=$(prompt "$B" "yes")
 check "the question is asked once" empty "$out"
 
 stop "$B" "Fixed, the token was expired."
-clear_from "$B" 111
 out=$(clear_to "$C" 111)
 check "without a title the question still reads" has "$(jq -r .systemMessage <<<"$out")" "Continue the previous work? Reply"
-clear_from "$C" 111
 clear_to "$D" 111 >/dev/null
 check "a session cleared before any prompt keeps the older link" has "$(cat "$threads/.live/ask-$D")" "$B"
 
@@ -164,21 +160,21 @@ check "what follows the yes is journaled" has "$(cat "$threads/$D.md")" "Yep, an
 prompt "$D" "now add a test"
 edit "$D" "$repo/src/auth.ts"
 stop "$D" "Test added."
-clear_from "$D" 111
 clear_to "$E" 111 >/dev/null
 out=$(prompt "$E" "Ok.")
 check "the handoff keeps the directory and the branch" has "$(injected "$out")" "$repo · feat/login"
 check "the handoff keeps the requests of the earlier sessions" has "$(injected "$out")" "fix the login bug"
-check "the handoff keeps the edited files" has "$(injected "$out")" "- edited: src/auth.ts"
+check "the handoff lists no edited file" lacks "$(injected "$out")" "src/auth.ts"
 check "the handoff keeps the last answer" has "$(injected "$out")" "Test added."
 check "without Jev the whole journal comes back" has "$(injected "$out")" "Fixed, the token was expired."
 check "the journal on disk stays whole" has "$(cat "$threads/$E.md")" "Fixed, the token was expired."
 check "a thread is one file" [ "$(journals)" = 2 ]
 check "a bare yes is not journaled" [ "$(grep -cx Ok. "$threads/$E.md")" = 0 ]
 
-clear_from "$G" 111
-out=$(clear_to "$F" 111)
-check "a session with no journal asks nothing" empty "$out"
+out=$(clear_to "$G" 111)
+check "after a bare yes the link follows the journal" has "$(jq -r .systemMessage <<<"$out")" "Continue the previous work"
+out=$(clear_to "$F" 999)
+check "a process without a journal asks nothing" empty "$out"
 
 prompt "$H" "review the PR"
 prompt "$H" '<agent-message from="a1">the reviewer found nothing</agent-message>'
@@ -281,8 +277,7 @@ jev '{"answers": {"s3": {"type": "noul", "noul": 0.8}}}'
 prompt "$U" "go"
 stop "$U" "Done, the cache is an in-memory map."
 settle "$U" 5
-clear_from "$U" 777
-clear_to "$V" 777 >/dev/null
+clear_to "$V" 111 >/dev/null
 rm -f "$fake/request.json"
 out=$(prompt "$V" "yes")
 check "with the scores up to date the yes asks nothing" [ ! -e "$fake/request.json" ]
@@ -298,8 +293,7 @@ sleep 0.5
 prompt "$V" "and another"
 stop "$V" "Neither."
 sleep 0.5
-clear_from "$V" 777
-clear_to "$W" 777 >/dev/null
+clear_to "$W" 111 >/dev/null
 jev '' 28
 out=$(prompt "$W" "yes")
 check "behind, the yes tries to catch up" [ -e "$fake/request.json" ]
@@ -315,8 +309,7 @@ prompt "$Y" "three"
 stop "$Y" "Third: $(printf 'x%.0s' {1..300})"
 prompt "$Y" "four"
 stop "$Y" "Fourth."
-clear_from "$Y" 888
-clear_to "$Z" 888 >/dev/null
+clear_to "$Z" 111 >/dev/null
 jev AUTO
 export CLAUDE_THREAD_STATE=600
 out=$(TYPESAFE_API_KEY=secret prompt "$Z" "yes")
@@ -330,8 +323,7 @@ prompt "$I" "no Redis, keep it in memory"
 stop "$I" "Plan: an in-memory map."
 prompt "$I" "go"
 stop "$I" "Done, the cache is an in-memory map."
-clear_from "$I" 333
-clear_to "$J" 333 >/dev/null
+clear_to "$J" 111 >/dev/null
 jev '{"answers": {"s1": {"type": "noul", "noul": 0.29}, "s3": {"type": "noul", "noul": 0.8}}}'
 out=$(TYPESAFE_API_KEY=secret prompt "$J" "yes")
 check "Jev is asked about each earlier answer" [ "$(jq -c '.questions | keys' "$fake/request.json")" = '["s1","s3"]' ]
@@ -349,8 +341,7 @@ prompt "$K" "and the tests?"
 stop "$K" "The tests cover the parser."
 prompt "$K" "thanks"
 stop "$K" "Nothing else to report."
-clear_from "$K" 444
-clear_to "$L" 444 >/dev/null
+clear_to "$L" 111 >/dev/null
 jev '{"answers": {"s1": {"type": "noul", "noul": 0.9}, "s3": {"type": "noul", "noul": 0.5}}}'
 out=$(TYPESAFE_API_KEY=secret prompt "$L" "yes")
 check "an answer that does not fit in 9000 bytes stays out" lacks "$(injected "$out")" "Audit: xxx"
@@ -360,8 +351,7 @@ prompt "$M" "plan the cache"
 stop "$M" "Use Redis for the cache."
 prompt "$M" "go"
 stop "$M" "Done, without Redis."
-clear_from "$M" 555
-clear_to "$N" 555 >/dev/null
+clear_to "$N" 111 >/dev/null
 jev '' 28
 out=$(TYPESAFE_API_KEY=secret prompt "$N" "yes" 2>&1)
 code=$?
@@ -370,20 +360,23 @@ check "when Jev fails and nothing was scored the whole journal comes back" has "
 check "when Jev fails it is not an error" [ "$code" = 0 ]
 prompt "$N" "one more thing"
 stop "$N" "Noted."
-clear_from "$N" 555
-clear_to "$O" 555 >/dev/null
+clear_to "$O" 111 >/dev/null
 jev '<html>502 Bad Gateway</html>'
 out=$(TYPESAFE_API_KEY=secret prompt "$O" "yes" 2>&1)
 check "an answer Jev garbles is ignored" has "$(injected "$out")" "Noted."
 
 prompt "$P" "say hello"
 stop "$P" "Hello."
-clear_from "$P" 666
-clear_to "$Q" 666 >/dev/null
+clear_to "$Q" 111 >/dev/null
 jev '{"answers": {}}'
 out=$(TYPESAFE_API_KEY=secret prompt "$Q" "yes")
 check "a journal with a single answer does not call Jev" [ ! -e "$fake/request.json" ]
 check "a journal with a single answer brings it back" has "$(injected "$out")" "Hello."
+
+N5=a5a5a5a5-0000 N6=a6a6a6a6-0000
+prompt "$N5" "rename the module"
+out=$(clear_to "$N6" 111)
+check "a turn interrupted after its request can still be continued" has "$(jq -r .systemMessage <<<"$out")" "Continue the previous work"
 
 check "the status line shows the session name, not the branch" [ "$(statusline "$A" "Ship the thing")" = "Ship the thing · 12k" ]
 check "the status line works without a name" [ "$(statusline "$A")" = "12k" ]
