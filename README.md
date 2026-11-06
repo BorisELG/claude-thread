@@ -18,8 +18,10 @@ Requirements: `bash`, `jq`, `curl`. Linux and macOS.
 ## How it works
 
 1. While you work, hooks keep a journal of the session: your requests and Claude's final answer of each turn. No model, no token, nothing in the console.
-2. After `/clear`, Claude asks: `Continue the previous work ("<title>")?`
+2. After `/clear`, Claude asks: `Continue the previous work ("<name>")?`
 3. Reply `yes`: the handoff comes with your prompt and Claude continues where it stopped. `yes, and fix the conflict first` works too: what comes with the yes is handled first. Anything else is a new request, and the cleared conversation stays in `/resume`.
+
+A thread keeps one name in `/resume`, from its first session to its last: the name you gave with `--name` or `/rename`, or else the title Claude Code generated for the first session. Every segment of the thread shows that name, and the live one is the most recent.
 
 The handoff is a state, not the conversation: your requests, the last answer, and the earlier answers that still hold. The edited files stay out, because `git diff` shows them after the yes. Rejected options and replaced plans stay out. Nothing is summarized or rewritten.
 

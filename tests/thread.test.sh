@@ -378,6 +378,24 @@ prompt "$N5" "rename the module"
 out=$(clear_to "$N6" 111)
 check "a turn interrupted after its request can still be continued" has "$(jq -r .systemMessage <<<"$out")" "Continue the previous work"
 
+# A thread keeps the name of its first session across every /clear, even though Claude Code
+# gives each new session its own generated title.
+N7=a7a7a7a7-0000 N8=a8a8a8a8-0000 N9=a9a9a9a9-0000
+named() { grep '"type":"custom-title"' "$work/$1.jsonl" | tail -n 1 | jq -r .customTitle; }
+yes_in() { hook UserPromptSubmit "$1" 111 "{\"prompt\":\"yes\",\"transcript_path\":\"$work/$1.jsonl\"}" >/dev/null; }
+title "$N7" "Cashless settings page"
+prompt "$N7" "build the settings page"
+stop "$N7" "Built."
+clear_to "$N8" 111 >/dev/null
+yes_in "$N8"
+# Claude Code then generates a title for the new session from the yes.
+jq -nc '{type: "ai-title", aiTitle: "Resume previous session"}' >>"$work/$N8.jsonl"
+stop "$N8" "Built again."
+out=$(clear_to "$N9" 111)
+check "the question names the thread, not the generated title" has "$(jq -r .systemMessage <<<"$out")" '("Cashless settings page")'
+yes_in "$N9"
+check "the name of the first session follows the thread past a second /clear" [ "$(named "$N9")" = "Cashless settings page" ]
+
 check "the status line shows the session name, not the branch" [ "$(statusline "$A" "Ship the thing")" = "Ship the thing · 12k" ]
 check "the status line works without a name" [ "$(statusline "$A")" = "12k" ]
 

@@ -18,6 +18,17 @@ link="$dir/.live/pid-$pid"
 ask="$dir/.live/ask-$session"
 doc="$dir/$session.md"
 notes="$dir/$session.jev.json"
+transcript=$(jq -r '.transcript_path // empty' <<<"$input")
+# The transcripts of the sessions of a thread sit side by side.
+previous_transcript() { printf '%s/%s.jsonl' "$(dirname "$transcript")" "$1"; }
+
+# The name /resume shows for a transcript: the name the user gave, else the generated title.
+name() {
+  local found
+  found=$(grep '"type":"custom-title"' "$1" | tail -n 1 | jq -r '.customTitle // empty')
+  [ -n "$found" ] || found=$(grep '"type":"ai-title"' "$1" | tail -n 1 | jq -r '.aiTitle // empty')
+  printf '%s' "$found"
+}
 
 # The link names the session whose journal a /clear of this process continues.
 live() { mkdir -p "$dir/.live" && printf '%s\n' "$session" >"$link"; }
@@ -151,9 +162,7 @@ SessionStart)
   [ -f "$link" ] || exit 0
   previous=$(head -n 1 "$link")
   [ -f "$dir/$previous.md" ] || exit 0
-  # The title is the one /resume shows. It sits in the transcript of the cleared session,
-  # next to the transcript of the new one.
-  title=$(grep '"type":"ai-title"' "$(dirname "$(jq -r '.transcript_path // empty' <<<"$input")")/$previous.jsonl" | tail -n 1 | jq -r '.aiTitle // empty')
+  title=$(name "$(previous_transcript "$previous")")
   echo "$previous" >"$ask"
   question="Continue the previous work${title:+ (\"$title\")}? Reply \"yes\" to continue it, or just type a new request."
   jq -n --arg question "$question" '{
@@ -173,6 +182,16 @@ UserPromptSubmit)
       mv "$dir/$previous.md" "$doc"
       [ ! -f "$dir/$previous.jev.json" ] || mv -f "$dir/$previous.jev.json" "$notes"
       live
+      # A thread keeps one name in /resume, the name of the session it continues. Claude Code
+      # carries a name given with /rename by itself, but gives each session after a /clear a
+      # new generated title. The new session takes the name as its own, so the next yes
+      # carries it again.
+      title=$(name "$(previous_transcript "$previous")")
+      if [ -n "$title" ] && [ -n "$transcript" ] && ! grep -q '"type":"custom-title"' "$transcript"; then
+        mkdir -p "$(dirname "$transcript")" &&
+          jq -nc --arg title "$title" --arg session "$session" \
+            '{type: "custom-title", customTitle: $title, sessionId: $session}' >>"$transcript"
+      fi
       # A short catch-up when the last turn's scoring failed; the yes then uses whatever is stored.
       ! behind || sections | score 2
       jq -n --rawfile handoff <(handoff | tail -c "${CLAUDE_THREAD_MAX:-60000}") '{
